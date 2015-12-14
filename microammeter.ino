@@ -63,6 +63,9 @@
 
   12 Dec 2015, V1.0, L. Shustek; first released version
 
+TODO:
+ - change to higher A-to-D resolution when sample rate is slow enough
+ 
 */
 
 #define VERSION "1.0"
