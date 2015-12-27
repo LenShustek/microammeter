@@ -62,13 +62,16 @@
   Change log
 
   12 Dec 2015, V1.0, L. Shustek; first released version
+  27 Dec 2015, V1.1, L. Shustek; add calibration correction for low currents
 
-TODO:
- - change to higher A-to-D resolution when sample rate is slow enough
- 
+  TODO:
+  - change to higher A-to-D resolution when sample rate is slow enough
+
 */
 
-#define VERSION "1.0"
+#define CURRENT_CALIBRATION_uA 31 // best average low-current calibration value from empirical measurements
+
+#define VERSION "1.1"
 #define DEBUG 0
 #define TESTING 0  // for testing without the chip
 
@@ -111,7 +114,7 @@ byte input_pins[] = {PB1, PB2, PB3, PB4, ROTARY1, ROTARY2, ROTARY3, ROTARY4};
 #define INA219_10bit 0b0001     // 10-bit A-to-D: 148 usec for each; really 390 usec for both
 #define INA219_11bit 0b0010     // 11-bit A-to-D: 276 usec for each; really 650 usec for both
 #define INA219_12bit 0b0011     // 12-bit A-to-D: 532 usec for each; really 1168 usec for both
-// Those "really" numbers are based on Teensy 3.1 at 72 Mhz and I2C bus at 2.4 Mhz in "immediate" mode.
+// Those "really" numbers are measurements on a Teensy 3.1 at 72 Mhz and I2C bus at 2.4 Mhz in "immediate" mode.
 // It is disappointing, but we can't sample every 500 usec in 10-bit mode. Just interrupt overhead?
 #define RESOLUTION INA219_10bit // which one we choose
 static uint16_t INA219_CONFIG =  // configuration register
@@ -130,8 +133,8 @@ unsigned int sample_rate_index = 3;  // default: 100 samples/second
 #define NUM_RES 4  // number of shunt resistors we can choose
 byte rotary_pins[NUM_RES] = {ROTARY1, ROTARY2, ROTARY3, ROTARY4};
 byte rotary_position; // 0..NUM_RES-1
-unsigned int shunt_res_x10[NUM_RES]  = {2, 10, 100, 1000};  // shunt resistors in 10th of an ohm
-unsigned int max_current_mA[NUM_RES] = {1500, 300, 30, 3};  // max current we advertise, in mA
+int shunt_res_x10[NUM_RES]  = {2, 10, 100, 1000};  // shunt resistors in 10th of an ohm
+int max_current_mA[NUM_RES] = {1500, 300, 30, 3};  // max current we advertise, in mA
 //                           .320V/R = {1600, 320, 32, 3.2} // true max current in mA
 
 #define DATALOGSIZE 5000
@@ -332,15 +335,13 @@ void sample_interrupt(void) {
   assert(wire_read16(INA219_REG_STATUS) & INA219_STATUS_CNVR, "sample not done");
 
   // Quickly read the raw data from the A-to-D converter and get the next conversion started.
-  // Note that these technically could be negative, but we really don't support AC measurement.
-  vshunt_uV = (long int)((int16_t) wire_read16(INA219_REG_SHUNTVOLTAGE)) * 10;
-  vbus_mV = ((int16_t)(wire_read16(INA219_REG_BUSVOLTAGE) & 0xfff8) >> 1); /* mult by 4uv/LSB */
+  uint16_t shuntVraw = wire_read16(INA219_REG_SHUNTVOLTAGE);
+  vshunt_uV = (long int)((int16_t)shuntVraw) * 10; // LSB is 10uV
+  vbus_mV = ((int16_t)(wire_read16(INA219_REG_BUSVOLTAGE) & 0xfff8) >> 1); // mult by 4uv/LSB
   START_CONVERSION; // get a headstart on the next conversion
-  if (vshunt_uV < 0) vshunt_uV = 0; // ignore negatives!
-  if (vbus_mV < 0) vbus_mV = 0;
 
-  // compute the instantaneous current and power
-  current_uA = vshunt_uV * 10 / shunt_res_x10[rotary_position];
+  // compute the instantaneous current and power, which might be negative
+  current_uA = vshunt_uV * 10 / shunt_res_x10[rotary_position] - CURRENT_CALIBRATION_uA;
   power_mW = (abs(((long long)current_uA * vbus_mV))) / 1000000LL;
 
   // make a log entry`
@@ -349,16 +350,16 @@ void sample_interrupt(void) {
   if (datalog_count < DATALOGSIZE) ++datalog_count;
   if (++datalog_index >= DATALOGSIZE) datalog_index = 0;
 
-  // Accumulate averages of voltage and current, and cumulative current, all of absolute values.
+  // Accumulate averages of voltage and current, and cumulative current, all with positive values only.
   // For insight on how this works, see the learned disquisition above about arithmetic.
   ++average_count;  // n+1:  new number of averaged samples
-  addendum = abs(current_uA) - average_current_uA + remainder_current_uA;  // average the current
+  addendum = max(current_uA, 0) - average_current_uA + remainder_current_uA; // average the current
   average_current_uA += addendum / average_count;
   remainder_current_uA = addendum % average_count;
-  addendum = abs(vbus_mV) - average_vbus_mV + remainder_vbus_mV; // average the voltage
+  addendum = max(vbus_mV, 0) - average_vbus_mV + remainder_vbus_mV; // average the voltage
   average_vbus_mV += addendum / average_count;
   remainder_vbus_mV = addendum % average_count;
-  cum_current_fAH += (abs((unsigned long long)current_uA  * usec_per_sample) * 1000 / 3600);
+  cum_current_fAH += ((unsigned long long)max(current_uA, 0)  * usec_per_sample) * 1000 / 3600;
 }
 
 //-----------------------------------------------------------------------------------------------------------------
@@ -452,10 +453,19 @@ void loop (void) {
       last_display_time = millis();
       // There are race conditions with cosmetic effects here if the interrupt routine updates
       // values as they are being read. But the next update will clean it up, so who cares.
-      sprintf(string, "Now %d.%03dV %3ld.%03ldmA",
-              vbus_mV / 1000, vbus_mV % 1000,
-              current_uA / 1000, current_uA % 1000);
-      lcd.setCursor(0, 0); lcd.print(string);
+      
+      lcd.setCursor(0, 0); lcd.print("Now"); // print current values, with negative signs if warranted
+      if (vbus_mV >= 0)
+        sprintf(string, "%2d.%03dV", vbus_mV / 1000, vbus_mV % 1000);
+      else
+        sprintf(string, "-%1d.%03dV", (-vbus_mV) / 1000, (-vbus_mV) % 1000);
+      lcd.print(string);
+      if (current_uA >= 0)
+        sprintf(string, "%4ld.%03ldmA", current_uA / 1000, current_uA % 1000);
+      else
+        sprintf(string, "-%3ld.%03ldmA", (-current_uA) / 1000, (-current_uA) % 1000);
+      lcd.print(string);
+
       sprintf(string, "%5d.%03dW%7ld.%ldS", power_mW / 1000, power_mW % 1000,
               average_count / (1000000L / usec_per_sample),
               (average_count / (100000L / usec_per_sample)) % 10);
