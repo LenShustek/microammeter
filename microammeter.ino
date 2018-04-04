@@ -24,8 +24,10 @@
    - The maximum current range can be 1500, 300, 30, or 3ma.
    - At the 3ma range, the resolution (not the accuracy!) is 0.1 uA.
    - Samples can be taken 1000, 500, 250, 100, 10, or 1 times per second.
-   - The last 5000 samples can be exported to a PC over a serial port in
+   - The last 5000 samples can be exported to a PC over a 9600 baud serial port in
      spreadsheet CSV (comma separated values) format, for graphing or other analysis.
+     (An easy way to import it is via the Arduino IDE's "Serial Monitor". )
+   - A scaled real-time analog output for use with a scope or logic analyzer.
 
   This is what the startup screen looks like:
 
@@ -63,6 +65,9 @@
 
   12 Dec 2015, V1.0, L. Shustek; first released version
   27 Dec 2015, V1.1, L. Shustek; add calibration correction for low currents
+  28 Dec 2015, V1.2, L. Shustek; make small negative currents display better
+  12 Mar 2016, V1.3, L. Shustek; add analog output for use with a scope or logic analyzer
+  30 May 2017, V1.4, L. Shustek; fix export to format negative voltages and currents correctly
 
   TODO:
   - change to higher A-to-D resolution when sample rate is slow enough
@@ -71,9 +76,10 @@
 
 #define CURRENT_CALIBRATION_uA 31 // best average low-current calibration value from empirical measurements
 
-#define VERSION "1.1"
+#define VERSION "1.4"
 #define DEBUG 0
 #define TESTING 0  // for testing without the chip
+#define ANALOG_OUTPUT 1 // analog output on pin A14?
 
 #include <arduino.h>
 #include <i2c_t3.h>   // Enhanced I2C library for Teensy 3.x; for current monitor
@@ -224,6 +230,11 @@ void setup() {
     pinMode(input_pins[i], INPUT_PULLUP);  //configure all input pins
 
   Wire.begin(I2C_MASTER, 0x00, I2C_PINS_18_19, I2C_PULLUP_EXT, I2C_RATE_2400, I2C_OP_MODE_IMM);
+
+#if ANALOG_OUTPUT
+  analogWriteResolution(12); // 0..4095 by hardware for A14
+#endif
+
   delay(1000);
 }
 
@@ -344,6 +355,11 @@ void sample_interrupt(void) {
   current_uA = vshunt_uV * 10 / shunt_res_x10[rotary_position] - CURRENT_CALIBRATION_uA;
   power_mW = (abs(((long long)current_uA * vbus_mV))) / 1000000LL;
 
+  // maybe output an analog voltage, ignoring negatives and scaling to 0..4095
+#if ANALOG_OUTPUT
+  analogWrite(A14, (int16_t)shuntVraw < 0 ? 0 : shuntVraw >> 3 );
+#endif
+
   // make a log entry`
   datalog[datalog_index].voltage_mV = vbus_mV;
   datalog[datalog_index].current_uA = current_uA;
@@ -440,10 +456,17 @@ void loop (void) {
       while (count < datalog_count) {
         unsigned long time_msec_x10;
         time_msec_x10 = (count + 1) * (usec_per_sample / 100);
-        sprintf(string, "%d, %lu.%04lu, %d.%03d, %ld.%03ld",
-                ++count, time_msec_x10 / 10000, time_msec_x10 % 10000,
-                datalog[index].voltage_mV / 1000, datalog[index].voltage_mV % 1000,
-                datalog[index].current_uA / 1000, datalog[index].current_uA % 1000);
+        sprintf(string, "%d, %lu.%04lu, ", ++count, time_msec_x10 / 10000, time_msec_x10 % 10000);
+        Serial.print(string);
+        if (datalog[index].voltage_mV >= 0)
+          sprintf(string, "%d.%03d, ", datalog[index].voltage_mV / 1000, datalog[index].voltage_mV % 1000);
+        else
+          sprintf(string, "-%d.%03d, ", (-datalog[index].voltage_mV) / 1000, (-datalog[index].voltage_mV) % 1000);
+        Serial.print(string);
+        if (datalog[index].current_uA >= 0)
+          sprintf(string, "%ld.%03ld", datalog[index].current_uA / 1000, datalog[index].current_uA % 1000);
+        else
+          sprintf(string, "-%ld.%03ld", (-datalog[index].current_uA) / 1000, (-datalog[index].current_uA) % 1000);
         Serial.println(string);
         if (++index >= DATALOGSIZE) index = 0;
       }
@@ -453,7 +476,7 @@ void loop (void) {
       last_display_time = millis();
       // There are race conditions with cosmetic effects here if the interrupt routine updates
       // values as they are being read. But the next update will clean it up, so who cares.
-      
+
       lcd.setCursor(0, 0); lcd.print("Now"); // print current values, with negative signs if warranted
       if (vbus_mV >= 0)
         sprintf(string, "%2d.%03dV", vbus_mV / 1000, vbus_mV % 1000);
@@ -462,8 +485,10 @@ void loop (void) {
       lcd.print(string);
       if (current_uA >= 0)
         sprintf(string, "%4ld.%03ldmA", current_uA / 1000, current_uA % 1000);
+      else if (current_uA / 1000 == 0)
+        sprintf(string, "  -0.%03ldmA", (-current_uA) % 1000);
       else
-        sprintf(string, "-%3ld.%03ldmA", (-current_uA) / 1000, (-current_uA) % 1000);
+        sprintf(string, "%4ld.%03ldmA", current_uA / 1000, (-current_uA) % 1000);
       lcd.print(string);
 
       sprintf(string, "%5d.%03dW%7ld.%ldS", power_mW / 1000, power_mW % 1000,
